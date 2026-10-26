@@ -1,0 +1,121 @@
+Proceso backend: "Procesar pago de cuotas" (explicación para desarrolladores)
+
+Resumen
+-------
+Este endpoint se encarga de registrar el pago de una o varias cuotas de un préstamo desde el backend (por ejemplo cuando el pago se confirma por una pasarela externa). El backend valida la request, crea el invoice, actualiza el registro del préstamo (metadata.paid_amount, last_payment_date y status), genera logs/auditoría y notifica al usuario.
+
+Endpoint sugerido
+-----------------
+POST /api/loans/process-payment
+Content-Type: application/json
+
+Propósito: recibir una confirmación de cobro y aplicar el pago al préstamo correspondiente en la base de datos.
+
+Body (JSON) - Campos recomendados
+---------------------------------
+{
+  "loan_id": "uuid-del-prestamo",           // Obligatorio - UUID del registro en `loans`
+  "user_id": "uuid-del-usuario",           // Obligatorio
+  "installments": [1,2],                    // Opcional - array de números de cuota pagadas
+  "amount": 1500.00,                        // Obligatorio si no se envía installments (monto cobrado)
+  "payment_method_id": "uuid-pm",         // Este no es necesario talvez solo de la fila de loans la columna payment method id 
+  "external_reference": "tx-12345",       // Recomendado - referencia de la pasarela (pago externo)
+  "currency": "MXN",                      // Opcional - default MXN
+  "metadata": { "note": "..." },        // Opcional - datos adicionales
+  "idempotency_key": "uuid-or-hash"       // Recomendado - para evitar duplicados
+  "reference":""
+}
+
+Validaciones y reglas de negocio
+--------------------------------
+- Verificar que `loan_id` exista. Si no existe, devolver 404.
+- Validar idempotencia: si ya se procesó una request con la misma `idempotency_key` o `external_reference`, devolver el resultado previo (200) en vez de aplicar cambios duplicados.
+- Validar que `amount` sea > 0.
+- Si `installments` se proporciona: calcular monto esperado para esas cuotas (opcional) y comparar con `amount`.
+- Proteger contra condiciones de carrera: ejecutar las operaciones críticas dentro de una transacción DB (Postgres) usando SELECT FOR UPDATE sobre la fila `loans` o sincronización equivalente (preferible que el backend haga la transacción).
+
+Operaciones DB (orden recomendado, dentro de transacción)
+---------------------------------------------------------
+1. Registrar/consultar idempotency record (tabla payments_idempotency) para evitar dobles.
+2. Insertar fila en `invoices` con status 'paid' o 'confirmed':
+   - Campos: user_id, amount, currency, status, metadata { loan_id, installments, external_reference, idempotency_key }
+3. Leer la fila del `loans` con FOR UPDATE:
+   - SELECT id, amount, metadata, status FROM loans WHERE id = $loan_id FOR UPDATE
+4. Calcular `currentPaid = Number(loan.metadata?.paid_amount || 0)` y `newPaid = currentPaid + amount`.
+5. Actualizar `loan.metadata` con `paid_amount: newPaid` y `last_payment_date: now()`.
+6. Actualizar `loan.status`:
+   - Si `newPaid >= loan.amount` => status = 'closed', set `closed_at = now()`
+   - En otro caso => status = 'active' (o conservar estado si ya era 'active')
+7. Opcional: insertar un registro en `loan_documents` o `payment_events` con detalle del pago (external_reference, method, file)
+8. Commit.
+
+Acciones posteriores (no deben romper la transacción)
+----------------------------------------------------
+- Enviar notificación al usuario (email / push) informando el pago.
+- Emitir webhook interno/externo si aplica.
+- Actualizar métricas y logs de auditoría.
+
+Manejo de errores
+-----------------
+- Si falla la verificación o la transacción: rollback y devolver 4xx/5xx apropiado.
+- Si idempotency indica request ya procesada: devolver 200 con payload del invoice ya creado.
+
+Respuesta (success)
+--------------------
+HTTP 200
+{
+  "ok": true,
+  "invoice_id": "uuid-invoice",
+  "loan_id": "uuid-loan",
+  "new_paid_amount": 4500.00,
+  "loan_status": "active|closed",
+}
+
+Respuesta (idempotent)
+----------------------
+HTTP 200
+{
+  "ok": true,
+  "idempotent": true,
+  "invoice_id": "uuid-invoice-existing",
+}
+
+Respuesta (error de validación)
+-------------------------------
+HTTP 400
+{
+  "ok": false,
+  "error": "Monto inválido o cuotas no válidas"
+}
+
+Notas operacionales y sugerencias
+---------------------------------
+- Implementar `idempotency_key` y guardar en una tabla separada para evitar duplicados si la pasarela reintenta.
+- Usar transacción en el servidor (preferible con PL/pgSQL o con driver backend que soporte transacciones) para garantizar atomicidad.
+- Registrar `external_reference` para conciliación con la pasarela.
+- Registrar el `payment_method_id` en `invoices` o en `payment_methods` si aplica.
+- Añadir auditoría: quién (admin/system) inició la operación, timestamp y payload.
+- Si el pago debe verificarse contra la pasarela (p. ej. cobro pendiente que luego confirma webhook), preferir modelo webhook: la pasarela llama al backend cuando la transacción se confirma y ese webhook dispara este endpoint o lógica.
+
+Ejemplo de flujo con pasarela externa (recomendado)
+---------------------------------------------------
+1. Usuario inicia cobro en frontend → frontend llama a la pasarela y obtiene `external_reference`.
+2. Pasarela procesa el pago (o redirige a 3DS) y una vez confirmado llama al webhook del backend.
+3. El webhook del backend valida la firma y llama internamente a la rutina descrita (la misma ruta o función) con `loan_id`, `amount`, `external_reference`, `idempotency_key`.
+
+Implementación mínima (pseudocódigo)
+------------------------------------
+POST /api/loans/process-payment
+- verificar body
+- if idempotency exists: return stored invoice
+- begin transaction
+- insert invoice (status: 'paid')
+- select loan FOR UPDATE
+- compute & update metadata.paid_amount
+- update loan.status
+- commit
+- async: notify user, emit webhook
+- return 200
+
+----------------------------
+Fin del documento
